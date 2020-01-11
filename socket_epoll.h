@@ -29,7 +29,7 @@ static int
 sp_add(int efd, int sock, void *ud) {
 	struct epoll_event ev;
 	ev.events = EPOLLIN;
-	ev.data.ptr = ud;
+	ev.data.ptr = ud; /* user data */
 	if (epoll_ctl(efd, EPOLL_CTL_ADD, sock, &ev) == -1) {
 		return 1;
 	}

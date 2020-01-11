@@ -29,12 +29,12 @@
 #define MIN_READ_BUFFER 64
 #define SOCKET_TYPE_INVALID 0
 #define SOCKET_TYPE_RESERVE 1
-#define SOCKET_TYPE_PLISTEN 2
+#define SOCKET_TYPE_PLISTEN 2  /* pre listen */
 #define SOCKET_TYPE_LISTEN 3
 #define SOCKET_TYPE_CONNECTING 4
 #define SOCKET_TYPE_CONNECTED 5
 #define SOCKET_TYPE_HALFCLOSE 6
-#define SOCKET_TYPE_PACCEPT 7
+#define SOCKET_TYPE_PACCEPT 7  /* pre accept */
 #define SOCKET_TYPE_BIND 8
 
 #define MAX_SOCKET (1<<MAX_SOCKET_P)
@@ -462,6 +462,7 @@ open_socket(struct socket_server *ss, struct request_open * request, struct sock
 		freeaddrinfo( ai_list );
 		return SOCKET_OPEN;
 	} else {
+        /* 异步connect未完成需要关注fd可写事件 */
 		ns->type = SOCKET_TYPE_CONNECTING;
 		sp_write(ss->event_fd, ns->fd, ns, true);
 	}
@@ -627,6 +628,7 @@ send_buffer(struct socket_server *ss, struct socket *s, struct socket_message *r
 			}
 		} else {
 			// step 4
+            /* buf中数据发送完成，则不再关注可写事件 */
 			sp_write(ss->event_fd, s->fd, s, false);
 
 			if (s->type == SOCKET_TYPE_HALFCLOSE) {
@@ -703,6 +705,7 @@ send_socket(struct socket_server *ss, struct request_send * request, struct sock
 		so.free_func(request->buffer);
 		return -1;
 	}
+    /* buf中无未发出数据，则直接通过socket发送，否则append到buf末尾，并关注可写事件 */
 	assert(s->type != SOCKET_TYPE_PLISTEN && s->type != SOCKET_TYPE_LISTEN);
 	if (send_buffer_empty(s) && s->type == SOCKET_TYPE_CONNECTED) {
 		if (s->protocol == PROTOCOL_TCP) {
@@ -739,6 +742,7 @@ send_socket(struct socket_server *ss, struct request_send * request, struct sock
 				return -1;
 			}
 		}
+        /* 有数据未发送完，则需append后关注可写事件 */
 		sp_write(ss->event_fd, s->fd, s, true);
 	} else {
 		if (s->protocol == PROTOCOL_TCP) {
@@ -834,6 +838,7 @@ start_socket(struct socket_server *ss, struct request_start *request, struct soc
 		return SOCKET_ERROR;
 	}
 	if (s->type == SOCKET_TYPE_PACCEPT || s->type == SOCKET_TYPE_PLISTEN) {
+        /* 开始监听listen fd可读 */
 		if (sp_add(ss->event_fd, s->fd, s)) {
 			s->type = SOCKET_TYPE_INVALID;
 			return SOCKET_ERROR;
@@ -1094,6 +1099,8 @@ forward_message_udp(struct socket_server *ss, struct socket *s, struct socket_me
 static int
 report_connect(struct socket_server *ss, struct socket *s, struct socket_message *result) {
 	int error;
+
+    /* 客户端connect可写事件到来，需要通过errno判断connect是否ok */
 	socklen_t len = sizeof(error);
 	int code = getsockopt(s->fd, SOL_SOCKET, SO_ERROR, &error, &len);
 	if (code < 0 || error) {
@@ -1137,6 +1144,7 @@ report_accept(struct socket_server *ss, struct socket *s, struct socket_message 
 	}
 	socket_keepalive(client_fd);
 	sp_nonblocking(client_fd);
+    /* 此处新的连接加并未加入epoll监听 */
 	struct socket *ns = new_fd(ss, id, client_fd, PROTOCOL_TCP, s->opaque, false);
 	if (ns == NULL) {
 		close(client_fd);
@@ -1181,7 +1189,9 @@ int
 socket_server_poll(struct socket_server *ss, struct socket_message * result, int * more) {
 	for (;;) {
 		if (ss->checkctrl) {
+            /* 检测是否有控制消息 */
 			if (has_cmd(ss)) {
+                /* 处理控制消息 */
 				int type = ctrl_cmd(ss, result);
 				if (type != -1) {
 					clear_closed_event(ss, result, type);
@@ -1192,6 +1202,8 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 				ss->checkctrl = 0;
 			}
 		}
+
+        /* 一次取多个事件，一次处理一个，处理完再wait */
 		if (ss->event_index == ss->event_n) {
 			ss->event_n = sp_wait(ss->event_fd, ss->ev, MAX_EVENT);
 			ss->checkctrl = 1;
@@ -1207,13 +1219,16 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 		struct event *e = &ss->ev[ss->event_index++];
 		struct socket *s = e->s;
 		if (s == NULL) {
+            /* 此处的s即为用户数据，为空表示为pipe可读事件 */
 			// dispatch pipe message at beginning
 			continue;
 		}
 		switch (s->type) {
 		case SOCKET_TYPE_CONNECTING:
+            /* client端 */
 			return report_connect(ss, s, result);
 		case SOCKET_TYPE_LISTEN:
+            /* server端 */
 			if (report_accept(ss, s, result)) {
 				return SOCKET_ACCEPT;
 			}
@@ -1222,6 +1237,7 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 			fprintf(stderr, "socket-server: invalid socket\n");
 			break;
 		default:
+            /* 可读事件 */
 			if (e->read) {
 				int type;
 				if (s->protocol == PROTOCOL_TCP) {
@@ -1234,6 +1250,8 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 						return SOCKET_UDP;
 					}
 				}
+
+                /* 注意此处处理，read事件处理后会返回，所以需要检测writeable，如果置位，则下次继续处理可写事件 */
 				if (e->write) {
 					// Try to dispatch write message next step if write flag set.
 					e->read = false;
@@ -1244,6 +1262,7 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 				clear_closed_event(ss, result, type);
 				return type;
 			}
+            /* 可写事件 */
 			if (e->write) {
 				int type = send_buffer(ss, s, result);
 				if (type == -1)
@@ -1256,6 +1275,7 @@ socket_server_poll(struct socket_server *ss, struct socket_message * result, int
 	}
 }
 
+/* 通过管道发送控制信息 */
 static void
 send_request(struct socket_server *ss, struct request_package *request, char type, int len) {
 	request->header[6] = (uint8_t)type;
