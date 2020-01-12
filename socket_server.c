@@ -1112,6 +1112,7 @@ report_connect(struct socket_server *ss, struct socket *s, struct socket_message
 		result->id = s->id;
 		result->ud = 0;
 		if (send_buffer_empty(s)) {
+            /* buf中无数据，取消链接可写关注 */
 			sp_write(ss->event_fd, s->fd, s, false);
 		}
 		union sockaddr_all u;
