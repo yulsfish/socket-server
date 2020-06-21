@@ -41,6 +41,7 @@ test(struct socket_server *ss) {
 	pthread_t pid;
 	pthread_create(&pid, NULL, _poll, ss);
 
+	/* 连接80端口会失败 */
 	int c = socket_server_connect(ss,100,"127.0.0.1",80);
 	printf("connecting %d\n",c);
 	int l = socket_server_listen(ss,200,"127.0.0.1",8888,32);
